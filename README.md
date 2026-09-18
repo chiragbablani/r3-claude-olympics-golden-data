@@ -12,8 +12,9 @@ Supports Python 3.10, 3.11, and 3.12.
 
 ```
 .
-├── pipeline.py         # entry point - the whole tool, stdlib only
-├── requirements.txt    # no third-party deps needed; Artifactory-ready if that changes
+├── pipeline.py            # entry point - the whole tool, stdlib only
+├── goldentarget_config.json  # grader manifest: run_command, runtime_version, requirements_file
+├── requirements.txt       # no third-party deps needed; Artifactory-ready if that changes
 └── README.md
 ```
 
@@ -55,6 +56,12 @@ cat submission.csv
 No `pip install` step is actually required — `pipeline.py` uses only the
 Python standard library, so there's nothing to fetch from Artifactory or
 PyPI. `requirements.txt` is kept for parity with the standard project layout.
+
+The grader drives the tool via `goldentarget_config.json`'s `run_command`
+(`python3 pipeline.py --data data/ --out submission.csv`), which expects the
+hidden pack placed at `data/` in the repo root before running. To reproduce
+that exact invocation locally, symlink or copy your pack to `data/` (already
+gitignored) instead of passing an arbitrary `--data` path.
 
 ## Notes
 
