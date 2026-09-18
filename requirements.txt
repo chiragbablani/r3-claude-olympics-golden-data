@@ -1,0 +1,7 @@
+# reconcile.py uses only the Python standard library (csv, json, urllib,
+# concurrent.futures, dataclasses) - no third-party packages are required.
+#
+# If you add any dependency later, install it from Lilly's JFrog Artifactory,
+# not public PyPI:
+#   pip install -r requirements.txt \
+#       --index-url https://elilillyco.jfrog.io/artifactory/api/pypi/<YOUR-PYPI-REPO-NAME>/simple
