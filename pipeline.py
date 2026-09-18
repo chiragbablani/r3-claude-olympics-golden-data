@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Golden Target reconciliation tool.
+Golden Target reconciliation pipeline.
 
 Usage:
-    python3 reconcile.py <pack_dir>
+    python3 pipeline.py --data <pack_dir> --out submission.csv
 
 Reads five source extracts from <pack_dir>:
     source_chembl.csv, source_uniprot.csv, source_bindingdb.csv,
@@ -12,12 +12,14 @@ Reads five source extracts from <pack_dir>:
 Resolves every referenced identity against the EBI Proteins API
 (https://www.ebi.ac.uk/proteins/api), builds one golden record per
 real-world target, and reports defects it can prove with retrieved
-evidence.
+evidence. Writes both to <out> as a single CSV (see README for the
+column schema).
 
 No third-party packages required (stdlib only): csv, json, re,
-urllib.request, concurrent.futures.
+urllib.request, concurrent.futures. Supports Python 3.10, 3.11, 3.12.
 """
 
+import argparse
 import csv
 import json
 import os
@@ -358,11 +360,16 @@ def extract_pub_phrase(context_sentence, target_mention):
 # Main reconciliation
 # --------------------------------------------------------------------------
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Golden Target reconciliation pipeline.")
+    parser.add_argument("--data", required=True, help="Directory containing the five source_*.csv files")
+    parser.add_argument("--out", default="submission.csv", help="Path to write the output CSV (default: submission.csv)")
+    return parser.parse_args()
+
+
 def main():
-    if len(sys.argv) != 2:
-        sys.stderr.write("usage: reconcile.py <pack_dir>\n")
-        sys.exit(1)
-    pack_dir = sys.argv[1]
+    args = parse_args()
+    pack_dir = args.data
     pack = load_pack(pack_dir)
     client = EBIClient()
 
@@ -813,13 +820,29 @@ def main():
         {"gene": g["gene"], "primary_accession": acc, "sources": sorted(g["sources"])}
         for acc, g in sorted(golden.items())
     ]
+    findings = list(finding_registry.values())
 
-    output = {
-        "unique_target_count": len(golden_records),
-        "golden_records": golden_records,
-        "findings": list(finding_registry.values()),
-    }
-    print(json.dumps(output, indent=2))
+    fieldnames = [
+        "record_type", "gene", "primary_accession", "sources",
+        "observed", "correct", "retrieved_evidence", "evidence_source",
+        "severity", "classification",
+    ]
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="", extrasaction="ignore")
+        writer.writeheader()
+        for rec in golden_records:
+            writer.writerow({
+                "record_type": "golden_record",
+                "gene": rec["gene"],
+                "primary_accession": rec["primary_accession"],
+                "sources": ";".join(rec["sources"]),
+            })
+        for finding in findings:
+            writer.writerow({"record_type": "finding", **finding})
+
+    sys.stderr.write(
+        f"wrote {len(golden_records)} golden records and {len(findings)} findings to {args.out}\n"
+    )
 
 
 if __name__ == "__main__":

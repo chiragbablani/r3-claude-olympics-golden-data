@@ -1,4 +1,4 @@
-# The Golden Target — reconciliation tool
+# The Golden Target — reconciliation pipeline
 
 Builds one golden record per drug-discovery target by reconciling five
 overlapping source extracts (ChEMBL, UniProt, BindingDB, an internal target
@@ -6,44 +6,55 @@ registry, and a literature-mention table) against the EBI Proteins API
 (https://www.ebi.ac.uk/proteins/api) as the authority, per the challenge
 brief.
 
+Supports Python 3.10, 3.11, and 3.12.
+
 ## Structure
 
 ```
 .
-├── reconcile.py       # entry point - the whole tool, stdlib only
-├── requirements.txt   # no third-party deps needed; Artifactory-ready if that changes
+├── pipeline.py         # entry point - the whole tool, stdlib only
+├── requirements.txt    # no third-party deps needed; Artifactory-ready if that changes
 └── README.md
 ```
 
 ## Contract
 
 ```
-python3 reconcile.py <pack_dir>
-```
-prints exactly one JSON object to stdout:
-```json
-{
-  "unique_target_count": <int>,
-  "golden_records": [{"gene": "...", "primary_accession": "...", "sources": ["..."]}],
-  "findings": [
-    {"gene": "...", "observed": "...", "correct": "...",
-     "retrieved_evidence": "...", "evidence_source": "...",
-     "severity": "...", "classification": "..."}
-  ]
-}
+python3 pipeline.py --data <pack_dir> --out submission.csv
 ```
 `<pack_dir>` is expected to contain `source_chembl.csv`, `source_uniprot.csv`,
 `source_bindingdb.csv`, `source_internal.csv`, and `source_publications.csv`.
 
+Writes a single CSV to `--out` (default `submission.csv`) with one row per
+golden record and one row per finding, distinguished by `record_type`:
+
+| column | golden_record | finding |
+|---|---|---|
+| `record_type` | `golden_record` | `finding` |
+| `gene` | ✓ | ✓ |
+| `primary_accession` | ✓ | |
+| `sources` | ✓ (`;`-joined) | |
+| `observed` | | ✓ |
+| `correct` | | ✓ |
+| `retrieved_evidence` | | ✓ |
+| `evidence_source` | | ✓ |
+| `severity` | | ✓ |
+| `classification` | | ✓ |
+
+Unused columns are left blank on each row.
+
 ## Testing locally
 
 ```
-python3 reconcile.py exam/ > output.json
-cat output.json
+cd r3-claude-olympics-golden-data
+pip install -r requirements.txt
+python3 pipeline.py --data ../path/to/data --out submission.csv
+cat submission.csv
 ```
 
-No `pip install` step is required — `reconcile.py` uses only the Python
-standard library, so there's nothing to fetch from Artifactory or PyPI.
+No `pip install` step is actually required — `pipeline.py` uses only the
+Python standard library, so there's nothing to fetch from Artifactory or
+PyPI. `requirements.txt` is kept for parity with the standard project layout.
 
 ## Notes
 
@@ -59,3 +70,4 @@ standard library, so there's nothing to fetch from Artifactory or PyPI.
   actually read the sentence before they're reported as a confirmed finding.
 - Cold run against the real exam pack (~640 unique accessions): ~19s.
   Warm (cached) run: ~3s. Well inside the 5-minute budget.
+
