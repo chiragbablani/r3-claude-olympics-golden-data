@@ -21,12 +21,13 @@ Supports Python 3.10, 3.11, and 3.12.
 ## Contract
 
 ```
-python3 pipeline.py [--data <pack_dir>] [--out <csv_path>]
+python3 pipeline.py [<pack_dir>] [--data <pack_dir>] [--out <csv_path>]
 ```
-`--data` defaults to `data/`, `--out` defaults to `submission.csv` — the
-grader invokes the script with no arguments at all, so both must have working
-defaults; pass either flag explicitly to point at a different pack or output
-location.
+The grader invokes the script as `python3 pipeline.py <hidden_pack_dir>` — a
+bare positional argument, no flags — so `pack_dir` is accepted positionally
+and takes priority over `--data` if both are given. `--data` defaults to
+`data/`, `--out` defaults to `submission.csv`, so `python3 pipeline.py` with
+no arguments at all also works, reading from `data/` in the repo root.
 
 `<pack_dir>` is expected to contain `source_chembl.csv`, `source_uniprot.csv`,
 `source_bindingdb.csv`, `source_internal.csv`, and `source_publications.csv`.
@@ -54,7 +55,7 @@ Unused columns are left blank on each row.
 ```
 cd r3-claude-olympics-golden-data
 pip install -r requirements.txt
-python3 pipeline.py --data ../path/to/data --out submission.csv
+python3 pipeline.py ../path/to/data
 cat submission.csv
 ```
 
@@ -62,11 +63,11 @@ No `pip install` step is actually required — `pipeline.py` uses only the
 Python standard library, so there's nothing to fetch from Artifactory or
 PyPI. `requirements.txt` is kept for parity with the standard project layout.
 
-The grader drives the tool via `goldentarget_config.json`'s `run_command`
-(`python3 pipeline.py`, no flags), which expects the hidden pack placed at
-`data/` in the repo root before running. To reproduce that exact invocation
-locally, symlink or copy your pack to `data/` (already gitignored) and run
-`python3 pipeline.py` with no arguments.
+The grader invokes `python3 pipeline.py <hidden_pack_dir>` directly, passing
+the pack directory as a bare positional argument — `goldentarget_config.json`'s
+`run_command` (`python3 pipeline.py`) just names the entrypoint, since the
+grader supplies the actual data path itself. To reproduce that exact
+invocation locally: `python3 pipeline.py ../path/to/data`.
 
 ## Notes
 

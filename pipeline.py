@@ -362,6 +362,8 @@ def extract_pub_phrase(context_sentence, target_mention):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Golden Target reconciliation pipeline.")
+    parser.add_argument("pack_dir", nargs="?", default=None,
+                         help="Directory containing the five source_*.csv files (positional; takes priority over --data)")
     parser.add_argument("--data", default="data/", help="Directory containing the five source_*.csv files (default: data/)")
     parser.add_argument("--out", default="submission.csv", help="Path to write the output CSV (default: submission.csv)")
     return parser.parse_args()
@@ -369,7 +371,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    pack_dir = args.data
+    pack_dir = args.pack_dir if args.pack_dir is not None else args.data
     pack = load_pack(pack_dir)
     client = EBIClient()
 
