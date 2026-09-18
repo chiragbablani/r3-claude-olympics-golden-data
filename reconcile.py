@@ -259,6 +259,34 @@ def organism_matches(observed: str, rec: ProteinRecord) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Defensive helpers -- the hidden dataset shares the schema, not the values.
+# Any of these fields can be None (short/truncated CSV rows -> DictReader
+# fills missing trailing cells with None, not "") or whitespace-only (a
+# single stray space is truthy in Python, so naive `if field:` checks let
+# it through as if it were real data).
+# --------------------------------------------------------------------------
+
+def safe_str(value) -> str:
+    """Never returns None -- turns a DictReader None (short row) into ''."""
+    return value if isinstance(value, str) else ""
+
+
+def first_token(value) -> Optional[str]:
+    """Safely gets the first whitespace-separated token, or None if there
+    isn't one -- handles None, "", and whitespace-only (" ") uniformly,
+    where a naive `.split()[0]` would IndexError on whitespace-only input."""
+    stripped = safe_str(value).strip()
+    return stripped.split()[0] if stripped else None
+
+
+def clean(value) -> Optional[str]:
+    """Strips a field and returns None if it's empty/whitespace-only,
+    rather than passing a truthy-but-blank string further down the pipeline."""
+    stripped = safe_str(value).strip()
+    return stripped if stripped else None
+
+
+# --------------------------------------------------------------------------
 # Gene label classification
 # --------------------------------------------------------------------------
 
@@ -278,8 +306,15 @@ def gene_label_status(observed_gene: str, rec: ProteinRecord) -> str:
 # --------------------------------------------------------------------------
 
 def load_csv(path):
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    """A missing file degrades to an empty source rather than crashing the
+    whole run -- a pack missing one file should still produce partial
+    results for the other four, not a zero score across the board."""
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except FileNotFoundError:
+        sys.stderr.write(f"WARN: {path} not found - treating as empty source\n")
+        return []
 
 
 def load_pack(pack_dir):
@@ -307,6 +342,8 @@ PUB_TEMPLATES = [
 def extract_pub_phrase(context_sentence, target_mention):
     """Return the descriptive phrase X the sentence actually names, or None if
     the sentence merely repeats the bare mention (nothing to cross-check)."""
+    context_sentence = safe_str(context_sentence)
+    target_mention = safe_str(target_mention)
     for pat in PUB_TEMPLATES:
         m = re.match(pat, context_sentence.strip())
         if m:
@@ -360,13 +397,13 @@ def main():
             row_gene_hint.setdefault(acc, r["gene_names"].split()[0])
     for r in pack["chembl"]:
         if r.get("accession") in unresolved:
-            row_gene_hint.setdefault(r["accession"], r.get("gene_symbol"))
+            row_gene_hint.setdefault(r["accession"], clean(r.get("gene_symbol")))
     for r in pack["bindingdb"]:
         if r.get("uniprot_id") in unresolved:
-            row_gene_hint.setdefault(r["uniprot_id"], r.get("gene_symbol"))
+            row_gene_hint.setdefault(r["uniprot_id"], clean(r.get("gene_symbol")))
     for r in pack["internal"]:
         if r.get("uniprot_ref") in unresolved:
-            row_gene_hint.setdefault(r["uniprot_ref"], r.get("gene_symbol"))
+            row_gene_hint.setdefault(r["uniprot_ref"], clean(r.get("gene_symbol")))
 
     indirect = {}  # accession -> (ProteinRecord, via_secondary: bool)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -431,197 +468,88 @@ def main():
     acc_to_observed_by_source = defaultdict(lambda: defaultdict(set))  # canonical_acc -> source -> {observed_ids}
 
     for r in pack["uniprot"]:
-        acc = r.get("accession")
-        rec, path = resolve_accession(acc)
-        if not rec:
-            continue
-        add_to_golden(rec, "uniprot")
-        acc_to_observed_by_source[rec.accession]["uniprot"].add(acc)
-        if path == "merged":
-            # NOTE: this branch was entirely missing -- chembl/bindingdb/internal
-            # all raise stale_accession when path=="merged"; the uniprot loop
-            # only ever checked gene/organism, so these accessions resolved
-            # correctly into the golden record (silently, via add_to_golden)
-            # but never surfaced as a finding at all.
-            add_finding(
-                rec.gene, f"accession={acc} in source_uniprot.csv (entry_name={r.get('entry_name')})",
-                f"accession={rec.accession}, gene={rec.gene}",
-                f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
-                f"accession of current entry {rec.accession}, retrieved via EBI Proteins API "
-                f"gene search using this row's own gene_names field",
-                "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
-                "medium", "stale_accession",
-                dedupe_key=acc,
-            )
-        observed_gene = (r.get("gene_names") or "").split()[0] if r.get("gene_names") else None
-        if observed_gene:
-            status = gene_label_status(observed_gene, rec)
-            if status == "mismatch":
+        try:
+            acc = r.get("accession")
+            rec, path = resolve_accession(acc)
+            if not rec:
+                continue
+            add_to_golden(rec, "uniprot")
+            acc_to_observed_by_source[rec.accession]["uniprot"].add(acc)
+            if path == "merged":
+                # NOTE: this branch was entirely missing -- chembl/bindingdb/internal
+                # all raise stale_accession when path=="merged"; the uniprot loop
+                # only ever checked gene/organism, so these accessions resolved
+                # correctly into the golden record (silently, via add_to_golden)
+                # but never surfaced as a finding at all.
                 add_finding(
-                    rec.gene, f"gene_names='{r.get('gene_names')}' for accession {acc}",
-                    f"{rec.gene}",
-                    f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}', synonyms {rec.synonyms}",
-                    "EBI Proteins API /proteins/{accession}",
-                    "high", "wrong_mapping",
+                    rec.gene, f"accession={acc} in source_uniprot.csv (entry_name={r.get('entry_name')})",
+                    f"accession={rec.accession}, gene={rec.gene}",
+                    f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
+                    f"accession of current entry {rec.accession}, retrieved via EBI Proteins API "
+                    f"gene search using this row's own gene_names field",
+                    "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
+                    "medium", "stale_accession",
                     dedupe_key=acc,
                 )
-        obs_org = r.get("organism", "")
-        if obs_org and not organism_matches(obs_org, rec):
-            add_finding(
-                rec.gene, f"organism='{obs_org}' for accession {acc}", rec.organism_sci,
-                f"EBI Proteins API accession {acc} -> organism '{rec.organism_sci}'",
-                "EBI Proteins API /proteins/{accession}",
-                "high", "wrong_organism",
-            )
+            observed_gene = first_token(r.get("gene_names"))
+            if observed_gene:
+                status = gene_label_status(observed_gene, rec)
+                if status == "mismatch":
+                    add_finding(
+                        rec.gene, f"gene_names='{r.get('gene_names')}' for accession {acc}",
+                        f"{rec.gene}",
+                        f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}', synonyms {rec.synonyms}",
+                        "EBI Proteins API /proteins/{accession}",
+                        "high", "wrong_mapping",
+                        dedupe_key=acc,
+                    )
+            obs_org = r.get("organism", "")
+            if obs_org and not organism_matches(obs_org, rec):
+                add_finding(
+                    rec.gene, f"organism='{obs_org}' for accession {acc}", rec.organism_sci,
+                    f"EBI Proteins API accession {acc} -> organism '{rec.organism_sci}'",
+                    "EBI Proteins API /proteins/{accession}",
+                    "high", "wrong_organism",
+                )
 
+        except Exception as _row_exc:
+            sys.stderr.write(f"WARN: skipping malformed row in uniprot loop: {_row_exc}\n")
+            continue
     # -- ChEMBL source --
     for r in pack["chembl"]:
-        acc = r.get("accession")
-        rec, path = resolve_accession(acc)
-        if not rec:
-            continue
-        add_to_golden(rec, "chembl")
+        try:
+            acc = r.get("accession")
+            rec, path = resolve_accession(acc)
+            if not rec:
+                continue
+            add_to_golden(rec, "chembl")
 
-        gene_obs = r.get("gene_symbol")
-        status = gene_label_status(gene_obs, rec)
-        if path == "merged":
-            add_finding(
-                rec.gene, f"accession={acc}, gene_symbol={gene_obs} (chembl_id {r.get('chembl_id')})",
-                f"accession={rec.accession}, gene={rec.gene}",
-                f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
-                f"accession of current entry {rec.accession} (gene {rec.gene}), retrieved via "
-                f"EBI Proteins API gene search for '{gene_obs}'",
-                "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
-                "medium", "stale_accession",
-                dedupe_key=acc,
-            )
-        elif status == "mismatch":
-            add_finding(
-                gene_obs, f"accession={acc}, gene_symbol={gene_obs} (chembl_id {r.get('chembl_id')})",
-                f"accession={rec.accession} actually corresponds to gene {rec.gene}",
-                f"EBI Proteins API accession {acc} -> gene '{rec.gene}' (synonyms {rec.synonyms}); "
-                f"'{gene_obs}' is not this entry's approved symbol or a known synonym",
-                "EBI Proteins API /proteins/{accession}",
-                "high", "wrong_mapping",
-                dedupe_key=acc,
-            )
-        elif status == "synonym":
-            add_finding(
-                rec.gene, f"gene_symbol={gene_obs} (accession {acc})", rec.gene,
-                f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}'; "
-                f"'{gene_obs}' is a listed prior/alternate symbol",
-                "EBI Proteins API /proteins/{accession}",
-                "low", "stale_gene_symbol",
-                dedupe_key=acc,
-            )
-
-        if rec.chembl_xref and r.get("chembl_id") and rec.chembl_xref != r["chembl_id"]:
-            add_finding(
-                rec.gene, f"chembl_id={r.get('chembl_id')} for accession {acc}", rec.chembl_xref,
-                f"EBI Proteins API accession {acc} cross-references ChEMBL id '{rec.chembl_xref}'",
-                "EBI Proteins API /proteins/{accession} (dbReferences)",
-                "medium", "wrong_cross_reference",
-                dedupe_key=acc,
-            )
-
-        obs_org = r.get("organism", "")
-        if obs_org and not organism_matches(obs_org, rec):
-            add_finding(
-                rec.gene, f"organism='{obs_org}' (chembl_id {r.get('chembl_id')})", rec.organism_sci,
-                f"EBI Proteins API accession {acc} -> organism '{rec.organism_sci}'",
-                "EBI Proteins API /proteins/{accession}",
-                "high", "wrong_organism",
-            )
-
-    # -- BindingDB source --
-    for r in pack["bindingdb"]:
-        acc = r.get("uniprot_id")
-        rec, path = resolve_accession(acc)
-        if not rec:
-            continue
-        add_to_golden(rec, "bindingdb")
-
-        gene_obs = r.get("gene_symbol")
-        status = gene_label_status(gene_obs, rec)
-        if path == "merged":
-            add_finding(
-                rec.gene, f"uniprot_id={acc}, gene_symbol={gene_obs} ('{r.get('target_name')}')",
-                f"uniprot_id={rec.accession}, gene={rec.gene}",
-                f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
-                f"accession of current entry {rec.accession} (gene {rec.gene}), retrieved via "
-                f"EBI Proteins API gene search for '{gene_obs}'",
-                "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
-                "medium", "stale_accession",
-                dedupe_key=acc,
-            )
-        elif status == "mismatch":
-            add_finding(
-                gene_obs, f"uniprot_id={acc}, gene_symbol={gene_obs} ('{r.get('target_name')}')",
-                f"uniprot_id={acc} actually corresponds to gene {rec.gene}",
-                f"EBI Proteins API accession {acc} -> gene '{rec.gene}' (synonyms {rec.synonyms})",
-                "EBI Proteins API /proteins/{accession}",
-                "high", "wrong_mapping",
-                dedupe_key=acc,
-            )
-        elif status == "synonym":
-            add_finding(
-                rec.gene, f"gene_symbol={gene_obs} (uniprot_id {acc})", rec.gene,
-                f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}'",
-                "EBI Proteins API /proteins/{accession}",
-                "low", "stale_gene_symbol",
-                dedupe_key=acc,
-            )
-
-        obs_species = r.get("species", "")
-        if obs_species and not organism_matches(obs_species, rec):
-            add_finding(
-                rec.gene, f"species='{obs_species}' (uniprot_id {acc})", rec.organism_sci,
-                f"EBI Proteins API accession {acc} -> organism '{rec.organism_sci}'",
-                "EBI Proteins API /proteins/{accession}",
-                "high", "wrong_organism",
-            )
-
-    # -- Internal registry source --
-    for r in pack["internal"]:
-        acc = r.get("uniprot_ref")
-        if not acc:
-            continue
-        rec, path = resolve_accession(acc)
-        if not rec:
-            continue
-        add_to_golden(rec, "internal")
-
-        gene_obs = r.get("gene_symbol")
-        if gene_obs:
+            gene_obs = clean(r.get("gene_symbol"))
             status = gene_label_status(gene_obs, rec)
             if path == "merged":
                 add_finding(
-                    rec.gene, f"uniprot_ref={acc}, gene_symbol={gene_obs} ({r.get('internal_id')})",
-                    f"uniprot_ref={rec.accession}, gene={rec.gene}",
+                    rec.gene, f"accession={acc}, gene_symbol={gene_obs} (chembl_id {r.get('chembl_id')})",
+                    f"accession={rec.accession}, gene={rec.gene}",
                     f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
-                    f"accession of current entry {rec.accession}",
+                    f"accession of current entry {rec.accession} (gene {rec.gene}), retrieved via "
+                    f"EBI Proteins API gene search for '{gene_obs}'",
                     "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
                     "medium", "stale_accession",
                     dedupe_key=acc,
                 )
             elif status == "mismatch":
                 add_finding(
-                    gene_obs, f"uniprot_ref={acc}, gene_symbol={gene_obs} ({r.get('internal_id')})",
-                    f"uniprot_ref={acc} actually corresponds to gene {rec.gene}",
-                    f"EBI Proteins API accession {acc} -> gene '{rec.gene}'",
+                    gene_obs, f"accession={acc}, gene_symbol={gene_obs} (chembl_id {r.get('chembl_id')})",
+                    f"accession={rec.accession} actually corresponds to gene {rec.gene}",
+                    f"EBI Proteins API accession {acc} -> gene '{rec.gene}' (synonyms {rec.synonyms}); "
+                    f"'{gene_obs}' is not this entry's approved symbol or a known synonym",
                     "EBI Proteins API /proteins/{accession}",
                     "high", "wrong_mapping",
                     dedupe_key=acc,
                 )
             elif status == "synonym":
-                # NOTE: this branch was missing entirely -- the chembl/bindingdb
-                # loops both raise a low-severity stale_gene_symbol finding here;
-                # the internal-registry loop jumped straight from "current" to
-                # "mismatch" and silently swallowed the synonym case, so any row
-                # using an old-but-valid HGNC symbol (e.g. SEPT9 -> SEPTIN9,
-                # WHSC1 -> NSD2) produced nothing at all.
                 add_finding(
-                    rec.gene, f"gene_symbol={gene_obs} (uniprot_ref {acc}, {r.get('internal_id')})", rec.gene,
+                    rec.gene, f"gene_symbol={gene_obs} (accession {acc})", rec.gene,
                     f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}'; "
                     f"'{gene_obs}' is a listed prior/alternate symbol",
                     "EBI Proteins API /proteins/{accession}",
@@ -629,6 +557,131 @@ def main():
                     dedupe_key=acc,
                 )
 
+            if rec.chembl_xref and r.get("chembl_id") and rec.chembl_xref != r["chembl_id"]:
+                add_finding(
+                    rec.gene, f"chembl_id={r.get('chembl_id')} for accession {acc}", rec.chembl_xref,
+                    f"EBI Proteins API accession {acc} cross-references ChEMBL id '{rec.chembl_xref}'",
+                    "EBI Proteins API /proteins/{accession} (dbReferences)",
+                    "medium", "wrong_cross_reference",
+                    dedupe_key=acc,
+                )
+
+            obs_org = r.get("organism", "")
+            if obs_org and not organism_matches(obs_org, rec):
+                add_finding(
+                    rec.gene, f"organism='{obs_org}' (chembl_id {r.get('chembl_id')})", rec.organism_sci,
+                    f"EBI Proteins API accession {acc} -> organism '{rec.organism_sci}'",
+                    "EBI Proteins API /proteins/{accession}",
+                    "high", "wrong_organism",
+                )
+
+        except Exception as _row_exc:
+            sys.stderr.write(f"WARN: skipping malformed row in chembl loop: {_row_exc}\n")
+            continue
+    # -- BindingDB source --
+    for r in pack["bindingdb"]:
+        try:
+            acc = r.get("uniprot_id")
+            rec, path = resolve_accession(acc)
+            if not rec:
+                continue
+            add_to_golden(rec, "bindingdb")
+
+            gene_obs = clean(r.get("gene_symbol"))
+            status = gene_label_status(gene_obs, rec)
+            if path == "merged":
+                add_finding(
+                    rec.gene, f"uniprot_id={acc}, gene_symbol={gene_obs} ('{r.get('target_name')}')",
+                    f"uniprot_id={rec.accession}, gene={rec.gene}",
+                    f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
+                    f"accession of current entry {rec.accession} (gene {rec.gene}), retrieved via "
+                    f"EBI Proteins API gene search for '{gene_obs}'",
+                    "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
+                    "medium", "stale_accession",
+                    dedupe_key=acc,
+                )
+            elif status == "mismatch":
+                add_finding(
+                    gene_obs, f"uniprot_id={acc}, gene_symbol={gene_obs} ('{r.get('target_name')}')",
+                    f"uniprot_id={acc} actually corresponds to gene {rec.gene}",
+                    f"EBI Proteins API accession {acc} -> gene '{rec.gene}' (synonyms {rec.synonyms})",
+                    "EBI Proteins API /proteins/{accession}",
+                    "high", "wrong_mapping",
+                    dedupe_key=acc,
+                )
+            elif status == "synonym":
+                add_finding(
+                    rec.gene, f"gene_symbol={gene_obs} (uniprot_id {acc})", rec.gene,
+                    f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}'",
+                    "EBI Proteins API /proteins/{accession}",
+                    "low", "stale_gene_symbol",
+                    dedupe_key=acc,
+                )
+
+            obs_species = r.get("species", "")
+            if obs_species and not organism_matches(obs_species, rec):
+                add_finding(
+                    rec.gene, f"species='{obs_species}' (uniprot_id {acc})", rec.organism_sci,
+                    f"EBI Proteins API accession {acc} -> organism '{rec.organism_sci}'",
+                    "EBI Proteins API /proteins/{accession}",
+                    "high", "wrong_organism",
+                )
+
+        except Exception as _row_exc:
+            sys.stderr.write(f"WARN: skipping malformed row in bindingdb loop: {_row_exc}\n")
+            continue
+    # -- Internal registry source --
+    for r in pack["internal"]:
+        try:
+            acc = r.get("uniprot_ref")
+            if not acc:
+                continue
+            rec, path = resolve_accession(acc)
+            if not rec:
+                continue
+            add_to_golden(rec, "internal")
+
+            gene_obs = clean(r.get("gene_symbol"))
+            if gene_obs:
+                status = gene_label_status(gene_obs, rec)
+                if path == "merged":
+                    add_finding(
+                        rec.gene, f"uniprot_ref={acc}, gene_symbol={gene_obs} ({r.get('internal_id')})",
+                        f"uniprot_ref={rec.accession}, gene={rec.gene}",
+                        f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
+                        f"accession of current entry {rec.accession}",
+                        "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
+                        "medium", "stale_accession",
+                        dedupe_key=acc,
+                    )
+                elif status == "mismatch":
+                    add_finding(
+                        gene_obs, f"uniprot_ref={acc}, gene_symbol={gene_obs} ({r.get('internal_id')})",
+                        f"uniprot_ref={acc} actually corresponds to gene {rec.gene}",
+                        f"EBI Proteins API accession {acc} -> gene '{rec.gene}'",
+                        "EBI Proteins API /proteins/{accession}",
+                        "high", "wrong_mapping",
+                        dedupe_key=acc,
+                    )
+                elif status == "synonym":
+                    # NOTE: this branch was missing entirely -- the chembl/bindingdb
+                    # loops both raise a low-severity stale_gene_symbol finding here;
+                    # the internal-registry loop jumped straight from "current" to
+                    # "mismatch" and silently swallowed the synonym case, so any row
+                    # using an old-but-valid HGNC symbol (e.g. SEPT9 -> SEPTIN9,
+                    # WHSC1 -> NSD2) produced nothing at all.
+                    add_finding(
+                        rec.gene, f"gene_symbol={gene_obs} (uniprot_ref {acc}, {r.get('internal_id')})", rec.gene,
+                        f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}'; "
+                        f"'{gene_obs}' is a listed prior/alternate symbol",
+                        "EBI Proteins API /proteins/{accession}",
+                        "low", "stale_gene_symbol",
+                        dedupe_key=acc,
+                    )
+
+        except Exception as _row_exc:
+            sys.stderr.write(f"WARN: skipping malformed row in internal loop: {_row_exc}\n")
+            continue
     # ---- 4. duplicate-identity pass: two different observed keys within the SAME
     #      source file resolving to the same canonical accession. Cross-source
     #      agreement (e.g. uniprot and internal both citing one real accession)
@@ -676,81 +729,85 @@ def main():
             gene_token_sets[rec.gene] |= tokens_of(name)
 
     for r in pack["publications"]:
-        mention = r.get("target_mention", "")
-        sentence = r.get("context_sentence", "")
-        phrase = extract_pub_phrase(sentence, mention)
-        if phrase is None:
-            continue  # sentence just repeats the bare symbol; nothing to cross-check
-        is_freeform = phrase.startswith("FREEFORM:")
-        phrase_text = phrase[len("FREEFORM:"):] if is_freeform else phrase
-        phrase_lower = phrase_text.lower().rstrip(".")
+        try:
+            mention = r.get("target_mention", "")
+            sentence = r.get("context_sentence", "")
+            phrase = extract_pub_phrase(sentence, mention)
+            if phrase is None:
+                continue  # sentence just repeats the bare symbol; nothing to cross-check
+            is_freeform = phrase.startswith("FREEFORM:")
+            phrase_text = phrase[len("FREEFORM:"):] if is_freeform else phrase
+            phrase_lower = phrase_text.lower().rstrip(".")
 
-        if not is_freeform:
-            # templated sentence: exact protein-name match against the known universe
-            owners = gene_names_index.get(phrase_lower, set())
-            if not owners:
-                # can't verify, but mention itself may still be a known gene -> attribute plainly
-                gene_to_acc = {g: acc for acc, g in [(rr.accession, rr.gene) for rr in list(direct.values()) + list(indirect.values())]}
-                if mention.upper() in {g.upper() for g in gene_to_acc}:
-                    for g, acc in gene_to_acc.items():
-                        if g and g.upper() == mention.upper():
-                            golden.setdefault(acc, {"gene": g, "sources": set()})["sources"].add("publications")
-                continue
-            if mention.upper() in {g.upper() for g in owners if g}:
-                # consistent: attribute this mention to its (confirmed) golden record
-                for rr in list(direct.values()) + list(indirect.values()):
-                    if rr.gene and rr.gene.upper() == mention.upper():
-                        golden.setdefault(rr.accession, {"gene": rr.gene, "sources": set()})["sources"].add("publications")
-                continue
-            other_genes = sorted(g for g in owners if g and g.upper() != mention.upper())
-            if other_genes:
-                add_finding(
-                    mention, f"target_mention='{mention}' with context_sentence: \"{sentence}\"",
-                    other_genes[0],
-                    f"context_sentence names '{phrase_text}', which matches gene "
-                    f"{other_genes[0]}'s protein name in EBI Proteins API (not '{mention}''s). "
-                    f"pmid was not fetched; resolved purely from shipped context_sentence text.",
-                    "EBI Proteins API protein-name lookup (context_sentence text only)",
-                    "high", "ambiguous_mention_misresolved",
-                )
-                # attribute the mention to the CORRECTED golden record, not the observed one
-                for rr in list(direct.values()) + list(indirect.values()):
-                    if rr.gene and rr.gene.upper() == other_genes[0].upper():
-                        golden.setdefault(rr.accession, {"gene": rr.gene, "sources": set()})["sources"].add("publications")
-        else:
-            # freeform / non-templated sentence: no reliable exact match available.
-            # Best-effort keyword overlap, reported as a REVIEW candidate, not an
-            # auto-confirmed correction -- this category needs a human (or Claude,
-            # reading the sentence) to confirm, deliberately, per the brief's
-            # "resolvable entirely from context_sentence text" note.
-            ptoks = tokens_of(phrase_text)
-            own_toks = gene_token_sets.get(mention.upper(), set())
-            own_overlap = len(ptoks & own_toks)
-            best_gene, best_overlap = None, 0
-            for g, toks in gene_token_sets.items():
-                if g.upper() == mention.upper():
+            if not is_freeform:
+                # templated sentence: exact protein-name match against the known universe
+                owners = gene_names_index.get(phrase_lower, set())
+                if not owners:
+                    # can't verify, but mention itself may still be a known gene -> attribute plainly
+                    gene_to_acc = {g: acc for acc, g in [(rr.accession, rr.gene) for rr in list(direct.values()) + list(indirect.values())]}
+                    if mention.upper() in {g.upper() for g in gene_to_acc}:
+                        for g, acc in gene_to_acc.items():
+                            if g and g.upper() == mention.upper():
+                                golden.setdefault(acc, {"gene": g, "sources": set()})["sources"].add("publications")
                     continue
-                ov = len(ptoks & toks)
-                if ov > best_overlap:
-                    best_gene, best_overlap = g, ov
-            if best_gene and best_overlap >= 2 and best_overlap > own_overlap:
-                add_finding(
-                    mention, f"target_mention='{mention}' with context_sentence: \"{sentence}\"",
-                    f"candidate: {best_gene} (needs manual confirmation)",
-                    f"context_sentence shares distinctive terms with gene {best_gene}'s "
-                    f"EBI-retrieved protein name/synonyms, and shares none/fewer with "
-                    f"'{mention}''s. pmid was not fetched. This is a NEEDS-REVIEW candidate, "
-                    f"not an auto-confirmed correction -- read the sentence to confirm.",
-                    "EBI Proteins API protein-name lookup (context_sentence text only)",
-                    "needs_review", "ambiguous_mention_candidate",
-                )
-                # left unattributed pending manual confirmation -- do not silently
-                # attach an unverified mention to either candidate's golden record
-            elif mention.upper() in gene_token_sets or own_toks:
-                for rr in list(direct.values()) + list(indirect.values()):
-                    if rr.gene and rr.gene.upper() == mention.upper():
-                        golden.setdefault(rr.accession, {"gene": rr.gene, "sources": set()})["sources"].add("publications")
+                if mention.upper() in {g.upper() for g in owners if g}:
+                    # consistent: attribute this mention to its (confirmed) golden record
+                    for rr in list(direct.values()) + list(indirect.values()):
+                        if rr.gene and rr.gene.upper() == mention.upper():
+                            golden.setdefault(rr.accession, {"gene": rr.gene, "sources": set()})["sources"].add("publications")
+                    continue
+                other_genes = sorted(g for g in owners if g and g.upper() != mention.upper())
+                if other_genes:
+                    add_finding(
+                        mention, f"target_mention='{mention}' with context_sentence: \"{sentence}\"",
+                        other_genes[0],
+                        f"context_sentence names '{phrase_text}', which matches gene "
+                        f"{other_genes[0]}'s protein name in EBI Proteins API (not '{mention}''s). "
+                        f"pmid was not fetched; resolved purely from shipped context_sentence text.",
+                        "EBI Proteins API protein-name lookup (context_sentence text only)",
+                        "high", "ambiguous_mention_misresolved",
+                    )
+                    # attribute the mention to the CORRECTED golden record, not the observed one
+                    for rr in list(direct.values()) + list(indirect.values()):
+                        if rr.gene and rr.gene.upper() == other_genes[0].upper():
+                            golden.setdefault(rr.accession, {"gene": rr.gene, "sources": set()})["sources"].add("publications")
+            else:
+                # freeform / non-templated sentence: no reliable exact match available.
+                # Best-effort keyword overlap, reported as a REVIEW candidate, not an
+                # auto-confirmed correction -- this category needs a human (or Claude,
+                # reading the sentence) to confirm, deliberately, per the brief's
+                # "resolvable entirely from context_sentence text" note.
+                ptoks = tokens_of(phrase_text)
+                own_toks = gene_token_sets.get(mention.upper(), set())
+                own_overlap = len(ptoks & own_toks)
+                best_gene, best_overlap = None, 0
+                for g, toks in gene_token_sets.items():
+                    if g.upper() == mention.upper():
+                        continue
+                    ov = len(ptoks & toks)
+                    if ov > best_overlap:
+                        best_gene, best_overlap = g, ov
+                if best_gene and best_overlap >= 2 and best_overlap > own_overlap:
+                    add_finding(
+                        mention, f"target_mention='{mention}' with context_sentence: \"{sentence}\"",
+                        f"candidate: {best_gene} (needs manual confirmation)",
+                        f"context_sentence shares distinctive terms with gene {best_gene}'s "
+                        f"EBI-retrieved protein name/synonyms, and shares none/fewer with "
+                        f"'{mention}''s. pmid was not fetched. This is a NEEDS-REVIEW candidate, "
+                        f"not an auto-confirmed correction -- read the sentence to confirm.",
+                        "EBI Proteins API protein-name lookup (context_sentence text only)",
+                        "needs_review", "ambiguous_mention_candidate",
+                    )
+                    # left unattributed pending manual confirmation -- do not silently
+                    # attach an unverified mention to either candidate's golden record
+                elif mention.upper() in gene_token_sets or own_toks:
+                    for rr in list(direct.values()) + list(indirect.values()):
+                        if rr.gene and rr.gene.upper() == mention.upper():
+                            golden.setdefault(rr.accession, {"gene": rr.gene, "sources": set()})["sources"].add("publications")
 
+        except Exception as _row_exc:
+            sys.stderr.write(f"WARN: skipping malformed row in publications loop: {_row_exc}\n")
+            continue
     # ---- 6. assemble output ----
     golden_records = [
         {"gene": g["gene"], "primary_accession": acc, "sources": sorted(g["sources"])}
