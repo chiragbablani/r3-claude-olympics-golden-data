@@ -3,7 +3,7 @@
 Golden Target reconciliation pipeline.
 
 Usage:
-    python3 pipeline.py --data <pack_dir> --out submission.csv
+    python3 pipeline.py <pack_dir>
 
 Reads five source extracts from <pack_dir>:
     source_chembl.csv, source_uniprot.csv, source_bindingdb.csv,
@@ -12,8 +12,8 @@ Reads five source extracts from <pack_dir>:
 Resolves every referenced identity against the EBI Proteins API
 (https://www.ebi.ac.uk/proteins/api), builds one golden record per
 real-world target, and reports defects it can prove with retrieved
-evidence. Writes both to <out> as a single CSV (see README for the
-column schema).
+evidence. Prints exactly one JSON object to stdout (see README for the
+schema) -- nothing else may go to stdout.
 
 No third-party packages required (stdlib only): csv, json, re,
 urllib.request, concurrent.futures. Supports Python 3.10, 3.11, 3.12.
@@ -365,7 +365,6 @@ def parse_args():
     parser.add_argument("pack_dir", nargs="?", default=None,
                          help="Directory containing the five source_*.csv files (positional; takes priority over --data)")
     parser.add_argument("--data", default="data/", help="Directory containing the five source_*.csv files (default: data/)")
-    parser.add_argument("--out", default="submission.csv", help="Path to write the output CSV (default: submission.csv)")
     return parser.parse_args()
 
 
@@ -822,29 +821,13 @@ def main():
         {"gene": g["gene"], "primary_accession": acc, "sources": sorted(g["sources"])}
         for acc, g in sorted(golden.items())
     ]
-    findings = list(finding_registry.values())
 
-    fieldnames = [
-        "record_type", "gene", "primary_accession", "sources",
-        "observed", "correct", "retrieved_evidence", "evidence_source",
-        "severity", "classification",
-    ]
-    with open(args.out, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="", extrasaction="ignore")
-        writer.writeheader()
-        for rec in golden_records:
-            writer.writerow({
-                "record_type": "golden_record",
-                "gene": rec["gene"],
-                "primary_accession": rec["primary_accession"],
-                "sources": ";".join(rec["sources"]),
-            })
-        for finding in findings:
-            writer.writerow({"record_type": "finding", **finding})
-
-    sys.stderr.write(
-        f"wrote {len(golden_records)} golden records and {len(findings)} findings to {args.out}\n"
-    )
+    output = {
+        "unique_target_count": len(golden_records),
+        "golden_records": golden_records,
+        "findings": list(finding_registry.values()),
+    }
+    print(json.dumps(output, indent=2))
 
 
 if __name__ == "__main__":
