@@ -175,8 +175,14 @@ class EBIClient:
             found_accs = set()
             for entry in data:
                 acc = entry.get("accession", "")
-                if "-" in acc:  # skip isoform-suffixed duplicates (e.g. P36888-2)
-                    continue
+                # NOTE: previously skipped any accession containing "-" to avoid
+                # unsolicited isoform pollution from gene-based searches. Confirmed
+                # via live testing that the accession-list endpoint only ever returns
+                # entries matching exactly what was requested (no unsolicited isoform
+                # rows), so an isoform-suffixed accession that was explicitly asked
+                # for (e.g. a row that only ever references "Q13422-3", with no bare
+                # "Q13422" anywhere in the pack) must be accepted, not discarded --
+                # discarding it here silently drops the whole target with zero trace.
                 found_accs.add(acc)
                 self.cache["by_accession"][acc] = entry
                 result[acc] = parse_protein_json(entry)
@@ -343,6 +349,15 @@ def main():
 
     # ---- 2. resolve the unresolved ones via their own row's gene label ----
     row_gene_hint = {}  # accession -> a gene symbol seen alongside it in some row
+    # NOTE: originally only chembl/bindingdb/internal were consulted here.
+    # source_uniprot.csv rows carry their own gene_names value too, and skipping
+    # them meant any bad accession that appears ONLY in the uniprot extract had
+    # no path to indirect (merged-accession) resolution at all -- it just
+    # silently vanished as "unresolved" with no finding raised.
+    for r in pack["uniprot"]:
+        acc = r.get("accession")
+        if acc in unresolved and r.get("gene_names"):
+            row_gene_hint.setdefault(acc, r["gene_names"].split()[0])
     for r in pack["chembl"]:
         if r.get("accession") in unresolved:
             row_gene_hint.setdefault(r["accession"], r.get("gene_symbol"))
@@ -377,7 +392,8 @@ def main():
         return None, "unresolved"
 
     # ---- 3. walk every source row, build findings + golden clusters ----
-    findings = []
+    finding_registry = {}  # (classification, dedupe_key) -> finding dict; dedupe_key=None means always-unique
+    _unique_counter = [0]
     golden = {}  # canonical_accession -> {"gene": ..., "sources": set()}
 
     def add_to_golden(rec, source_name):
@@ -386,8 +402,22 @@ def main():
         entry = golden.setdefault(rec.accession, {"gene": rec.gene, "sources": set()})
         entry["sources"].add(source_name)
 
-    def add_finding(gene, observed, correct, evidence, source, severity, classification):
-        findings.append({
+    def add_finding(gene, observed, correct, evidence, source, severity, classification, dedupe_key=None):
+        # dedupe_key groups findings that describe the SAME underlying defect
+        # (e.g. the same stale accession) even when it's independently visible
+        # in more than one source file -- one finding per real-world defect,
+        # not one per row it happens to show up in.
+        if dedupe_key is None:
+            _unique_counter[0] += 1
+            key = ("_unique", _unique_counter[0])
+        else:
+            key = (classification, dedupe_key)
+
+        if key in finding_registry:
+            finding_registry[key]["observed"] += f" | ALSO: {observed}"
+            return
+
+        finding_registry[key] = {
             "gene": gene,
             "observed": observed,
             "correct": correct,
@@ -395,15 +425,34 @@ def main():
             "evidence_source": source,
             "severity": severity,
             "classification": classification,
-        })
+        }
 
     # -- UniProt source: mostly definitional, but still verify --
+    acc_to_observed_by_source = defaultdict(lambda: defaultdict(set))  # canonical_acc -> source -> {observed_ids}
+
     for r in pack["uniprot"]:
         acc = r.get("accession")
         rec, path = resolve_accession(acc)
         if not rec:
             continue
         add_to_golden(rec, "uniprot")
+        acc_to_observed_by_source[rec.accession]["uniprot"].add(acc)
+        if path == "merged":
+            # NOTE: this branch was entirely missing -- chembl/bindingdb/internal
+            # all raise stale_accession when path=="merged"; the uniprot loop
+            # only ever checked gene/organism, so these accessions resolved
+            # correctly into the golden record (silently, via add_to_golden)
+            # but never surfaced as a finding at all.
+            add_finding(
+                rec.gene, f"accession={acc} in source_uniprot.csv (entry_name={r.get('entry_name')})",
+                f"accession={rec.accession}, gene={rec.gene}",
+                f"Accession {acc} not resolvable directly (obsolete); found as a secondary "
+                f"accession of current entry {rec.accession}, retrieved via EBI Proteins API "
+                f"gene search using this row's own gene_names field",
+                "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
+                "medium", "stale_accession",
+                dedupe_key=acc,
+            )
         observed_gene = (r.get("gene_names") or "").split()[0] if r.get("gene_names") else None
         if observed_gene:
             status = gene_label_status(observed_gene, rec)
@@ -414,6 +463,7 @@ def main():
                     f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}', synonyms {rec.synonyms}",
                     "EBI Proteins API /proteins/{accession}",
                     "high", "wrong_mapping",
+                    dedupe_key=acc,
                 )
         obs_org = r.get("organism", "")
         if obs_org and not organism_matches(obs_org, rec):
@@ -443,6 +493,7 @@ def main():
                 f"EBI Proteins API gene search for '{gene_obs}'",
                 "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
                 "medium", "stale_accession",
+                dedupe_key=acc,
             )
         elif status == "mismatch":
             add_finding(
@@ -452,6 +503,7 @@ def main():
                 f"'{gene_obs}' is not this entry's approved symbol or a known synonym",
                 "EBI Proteins API /proteins/{accession}",
                 "high", "wrong_mapping",
+                dedupe_key=acc,
             )
         elif status == "synonym":
             add_finding(
@@ -460,6 +512,7 @@ def main():
                 f"'{gene_obs}' is a listed prior/alternate symbol",
                 "EBI Proteins API /proteins/{accession}",
                 "low", "stale_gene_symbol",
+                dedupe_key=acc,
             )
 
         if rec.chembl_xref and r.get("chembl_id") and rec.chembl_xref != r["chembl_id"]:
@@ -468,6 +521,7 @@ def main():
                 f"EBI Proteins API accession {acc} cross-references ChEMBL id '{rec.chembl_xref}'",
                 "EBI Proteins API /proteins/{accession} (dbReferences)",
                 "medium", "wrong_cross_reference",
+                dedupe_key=acc,
             )
 
         obs_org = r.get("organism", "")
@@ -498,6 +552,7 @@ def main():
                 f"EBI Proteins API gene search for '{gene_obs}'",
                 "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
                 "medium", "stale_accession",
+                dedupe_key=acc,
             )
         elif status == "mismatch":
             add_finding(
@@ -506,6 +561,7 @@ def main():
                 f"EBI Proteins API accession {acc} -> gene '{rec.gene}' (synonyms {rec.synonyms})",
                 "EBI Proteins API /proteins/{accession}",
                 "high", "wrong_mapping",
+                dedupe_key=acc,
             )
         elif status == "synonym":
             add_finding(
@@ -513,6 +569,7 @@ def main():
                 f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}'",
                 "EBI Proteins API /proteins/{accession}",
                 "low", "stale_gene_symbol",
+                dedupe_key=acc,
             )
 
         obs_species = r.get("species", "")
@@ -545,6 +602,7 @@ def main():
                     f"accession of current entry {rec.accession}",
                     "EBI Proteins API /proteins?gene=...  (secondaryAccession match)",
                     "medium", "stale_accession",
+                    dedupe_key=acc,
                 )
             elif status == "mismatch":
                 add_finding(
@@ -553,27 +611,48 @@ def main():
                     f"EBI Proteins API accession {acc} -> gene '{rec.gene}'",
                     "EBI Proteins API /proteins/{accession}",
                     "high", "wrong_mapping",
+                    dedupe_key=acc,
+                )
+            elif status == "synonym":
+                # NOTE: this branch was missing entirely -- the chembl/bindingdb
+                # loops both raise a low-severity stale_gene_symbol finding here;
+                # the internal-registry loop jumped straight from "current" to
+                # "mismatch" and silently swallowed the synonym case, so any row
+                # using an old-but-valid HGNC symbol (e.g. SEPT9 -> SEPTIN9,
+                # WHSC1 -> NSD2) produced nothing at all.
+                add_finding(
+                    rec.gene, f"gene_symbol={gene_obs} (uniprot_ref {acc}, {r.get('internal_id')})", rec.gene,
+                    f"EBI Proteins API accession {acc} -> current approved gene '{rec.gene}'; "
+                    f"'{gene_obs}' is a listed prior/alternate symbol",
+                    "EBI Proteins API /proteins/{accession}",
+                    "low", "stale_gene_symbol",
+                    dedupe_key=acc,
                 )
 
-    # ---- 4. duplicate-identity pass: two different observed keys -> same canonical accession ----
-    acc_to_observed_keys = defaultdict(set)
+    # ---- 4. duplicate-identity pass: two different observed keys within the SAME
+    #      source file resolving to the same canonical accession. Cross-source
+    #      agreement (e.g. uniprot and internal both citing one real accession)
+    #      is normal and NOT a duplicate -- only flag when one source's OWN rows
+    #      disagree with themselves about how many distinct targets this is.
     for r in pack["internal"]:
         acc = r.get("uniprot_ref")
         if acc:
             rec, _ = resolve_accession(acc)
             if rec:
-                acc_to_observed_keys[rec.accession].add(("internal", r.get("internal_id")))
-    for canon_acc, keys in acc_to_observed_keys.items():
-        if len(keys) > 1:
-            gene = golden.get(canon_acc, {}).get("gene")
-            add_finding(
-                gene, f"{len(keys)} internal registry entries resolve to the same target: {sorted(keys)}",
-                f"single golden record, primary_accession={canon_acc}",
-                f"All listed internal_id rows resolve (directly or via merged-accession lookup) to "
-                f"the same current UniProt accession {canon_acc}",
-                "EBI Proteins API /proteins/{accession} + /proteins?gene=...",
-                "medium", "duplicate_identity",
-            )
+                acc_to_observed_by_source[rec.accession]["internal"].add(r.get("internal_id"))
+
+    for canon_acc, by_source in acc_to_observed_by_source.items():
+        gene = golden.get(canon_acc, {}).get("gene")
+        for source_name, keys in by_source.items():
+            if len(keys) > 1:
+                add_finding(
+                    gene, f"{len(keys)} distinct {source_name} rows resolve to the same target: {sorted(keys)}",
+                    f"single golden record, primary_accession={canon_acc}",
+                    f"All listed {source_name} rows resolve (directly or via merged-accession "
+                    f"lookup) to the same current UniProt accession {canon_acc}",
+                    "EBI Proteins API /proteins/{accession} + /proteins?gene=...",
+                    "medium", "duplicate_identity",
+                )
 
     # ---- 5. publications: text-only cross-check, pmid NEVER fetched ----
     gene_names_index = defaultdict(set)  # lowercased name/phrase -> set of gene symbols
@@ -681,7 +760,7 @@ def main():
     output = {
         "unique_target_count": len(golden_records),
         "golden_records": golden_records,
-        "findings": findings,
+        "findings": list(finding_registry.values()),
     }
     print(json.dumps(output, indent=2))
 
