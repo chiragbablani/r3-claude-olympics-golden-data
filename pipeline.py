@@ -362,7 +362,7 @@ def extract_pub_phrase(context_sentence, target_mention):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Golden Target reconciliation pipeline.")
-    parser.add_argument("--data", required=True, help="Directory containing the five source_*.csv files")
+    parser.add_argument("--data", default="data/", help="Directory containing the five source_*.csv files (default: data/)")
     parser.add_argument("--out", default="submission.csv", help="Path to write the output CSV (default: submission.csv)")
     return parser.parse_args()
 

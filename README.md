@@ -21,8 +21,13 @@ Supports Python 3.10, 3.11, and 3.12.
 ## Contract
 
 ```
-python3 pipeline.py --data <pack_dir> --out submission.csv
+python3 pipeline.py [--data <pack_dir>] [--out <csv_path>]
 ```
+`--data` defaults to `data/`, `--out` defaults to `submission.csv` — the
+grader invokes the script with no arguments at all, so both must have working
+defaults; pass either flag explicitly to point at a different pack or output
+location.
+
 `<pack_dir>` is expected to contain `source_chembl.csv`, `source_uniprot.csv`,
 `source_bindingdb.csv`, `source_internal.csv`, and `source_publications.csv`.
 
@@ -58,10 +63,10 @@ Python standard library, so there's nothing to fetch from Artifactory or
 PyPI. `requirements.txt` is kept for parity with the standard project layout.
 
 The grader drives the tool via `goldentarget_config.json`'s `run_command`
-(`python3 pipeline.py --data data/ --out submission.csv`), which expects the
-hidden pack placed at `data/` in the repo root before running. To reproduce
-that exact invocation locally, symlink or copy your pack to `data/` (already
-gitignored) instead of passing an arbitrary `--data` path.
+(`python3 pipeline.py`, no flags), which expects the hidden pack placed at
+`data/` in the repo root before running. To reproduce that exact invocation
+locally, symlink or copy your pack to `data/` (already gitignored) and run
+`python3 pipeline.py` with no arguments.
 
 ## Notes
 
